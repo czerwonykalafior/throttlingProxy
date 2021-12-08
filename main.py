@@ -20,8 +20,15 @@
 import time
 from functools import total_ordering
 from queue import PriorityQueue
+from typing import List
 
-available_quotas = {'amazon.com': [1, 1, 1, 1, 1], 'google.com': [1, 1, 1], 'puccinos': [1]}
+import aioredis
+
+available_quotas = {
+    "amazon.com": [1, 1, 1, 1, 1],
+    "google.com": [1, 1, 1],
+    "puccinos": [1],
+}
 
 
 @total_ordering
@@ -40,8 +47,9 @@ class RequestQuota:
 
 class ThrottlingManager:
     def __init__(self):
-        self.registered_domains = {}  # this needs work
+        self.registered_domains = {}  # TODO: this needs work
         self.next_quota_reset: PriorityQueue[RequestQuota] = PriorityQueue()
+        self.registered_domains = aioredis.from_url("redis://localhost:6379")
 
     def on_domain_change(self, domain: str, strategy: str) -> None:
         self._register_domain(domain, strategy)
@@ -49,29 +57,65 @@ class ThrottlingManager:
 
     def _register_domain(self, domain: str, strategy: str) -> None:
         self.registered_domains[domain] = strategy
-        self._schedule_next_reset(domain=domain, previous_request_at=time.time() - 1000)  # whatever in the past
+        self._schedule_next_reset(
+            domain=domain, previous_request_at=time.time() - 1000
+        )  # whatever in the past
 
     def _schedule_next_reset(self, domain: str, previous_request_at: float) -> None:
         throttling_strategy = self.registered_domains[domain]
-        next_request_time, concurrent_requests_count = throttling_strategy(previous_request_at)
-        self.next_quota_reset.put(RequestQuota(domain, next_request_time, concurrent_requests_count))
+        next_request_time, concurrent_requests_count = throttling_strategy(
+            previous_request_at
+        )
+        self.next_quota_reset.put(
+            RequestQuota(domain, next_request_time, concurrent_requests_count)
+        )
 
-    def monitor_quota(self) -> None:
+    def refill_quota(self) -> None:
+        to_be_refiled = []
+
         while self.next_quota_reset:
             quota = self.next_quota_reset.get()
             if quota.next_request_at <= time.time():
-                quota_to_refill = quota.concurrent_requests - len(available_quotas[quota.domain])
-                # count how many times it was 0 and if 100 in a row than remove the quota from redis
-                available_quotas[quota.domain].extend([1] * quota_to_refill)  # this would be redis pipeline
-                self._schedule_next_reset(domain=quota.domain, previous_request_at=quota.next_request_at)
+                to_be_refiled.append(quota)
+
                 # to optimize this we can add new items once we're done replenishing
             else:
                 self.next_quota_reset.put(quota)  # put it back
+                self.add_quota(to_be_refiled)
+
+                for quota in to_be_refiled:
+                    self._schedule_next_reset(
+                        domain=quota.domain, previous_request_at=quota.next_request_at
+                    )
+                to_be_refiled = []
+
+            # TODO: every 1 min check for empty `domain`_queue if queue is empty X times in a row unregister this domain
+
+    async def add_quota(self, quotas: List[RequestQuota]):
+        async with self.redis_connection.pipeline() as pipeline:
+            # TODO: for now semi High Availability can be done as - separate instance process/throttle some part for domain_status
+
+            [
+                pipeline.lpush(quota.domain, 1)
+                for quota in quotas
+                for _ in range(quota.concurrent_requests)
+            ]
+
+            [
+                pipeline.ltrim(quota.domain, 0, quota.concurrent_requests)
+                for quota in quotas
+            ]
+            # in case quota was not consumed we don't want to add to infinity
+
+            result = await pipeline.execute()
+
+            print("Quotas refilled.", result)
 
     @staticmethod
     def _remove_quota(domain: str) -> None:
-        """ Remove a list from available_semaphores """
+        """Remove a list from available_semaphores"""
         del available_quotas[domain]
+
 
 # quotas only for active robots? when starting a robot call Throttling manager?
 # how to make this work for KAPOW or anything
