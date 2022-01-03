@@ -35,86 +35,64 @@ available_quotas = {
 class RequestQuota:
     def __init__(self, domain: str, next_request_at: float, concurrent_requests: int):
         self.domain = domain
-        self.next_request_at = next_request_at
-        self.concurrent_requests = concurrent_requests
+        self.next_req = next_request_at
+        self.concurrent_req = concurrent_requests
 
     def __eq__(self, other):
-        return self.next_request_at == other.next_request_at
+        return self.next_req == other.next_req
 
     def __lt__(self, other):
-        return self.next_request_at < other.next_request_at
+        return self.next_req < other.next_req
 
 
 class ThrottlingManager:
     def __init__(self):
-        self.registered_domains = {}  # TODO: this needs work
+        self.registered_domains = {}  # TODO: get all domains for DB
         self.next_quota_reset: PriorityQueue[RequestQuota] = PriorityQueue()
-        self.registered_domains = aioredis.from_url("redis://localhost:6379")
+        self.redis_connection = aioredis.from_url("redis://localhost:6379")
 
-    def on_domain_change(self, domain: str, strategy: str) -> None:
-        self._register_domain(domain, strategy)
-        self._remove_quota(domain)
+    def __on_domain_change(self) -> None:
+        """ Subscribe on domain throttling table. """
+        domains = {}  # new or changed
+        for domain, strategy in domains:
+            await self._remove_quota(domain)
+            self._register_domain(domain, strategy)
 
     def _register_domain(self, domain: str, strategy: str) -> None:
         self.registered_domains[domain] = strategy
-        self._schedule_next_reset(
-            domain=domain, previous_request_at=time.time() - 1000
-        )  # whatever in the past
+        self._schedule_next_quota(domain=domain, previous_req=time.time() - 1000)
 
-    def _schedule_next_reset(self, domain: str, previous_request_at: float) -> None:
+    def _schedule_next_quota(self, domain: str, previous_req: float) -> None:
         throttling_strategy = self.registered_domains[domain]
-        next_request_time, concurrent_requests_count = throttling_strategy(
-            previous_request_at
-        )
-        self.next_quota_reset.put(
-            RequestQuota(domain, next_request_time, concurrent_requests_count)
-        )
+        next_request_time, concurrent_requests_count = throttling_strategy(previous_req)
+        self.next_quota_reset.put(RequestQuota(domain, next_request_time, concurrent_requests_count))
 
     def refill_quota(self) -> None:
-        to_be_refiled = []
-
         while self.next_quota_reset:
-            quota = self.next_quota_reset.get()
-            if quota.next_request_at <= time.time():
-                to_be_refiled.append(quota)
+            quota = self.next_quota_reset.queue[0]
 
-                # to optimize this we can add new items once we're done replenishing
-            else:
-                self.next_quota_reset.put(quota)  # put it back
-                self.add_quota(to_be_refiled)
-
-                for quota in to_be_refiled:
-                    self._schedule_next_reset(
-                        domain=quota.domain, previous_request_at=quota.next_request_at
-                    )
-                to_be_refiled = []
+            if quota.next_req <= time.time():
+                quota = self.next_quota_reset.get()  # optimization: take from the queue if it's the right time
+                self.add_quota(quota)  # TODO: optimization: get all quotas that pass the time and add in batch
+                self._schedule_next_quota(domain=quota.domain, previous_req=quota.next_req)
+                # TODO: optimization: this we can add new items once we're done replenishing
 
             # TODO: every 1 min check for empty `domain`_queue if queue is empty X times in a row unregister this domain
 
-    async def add_quota(self, quotas: List[RequestQuota]):
+    async def add_quota(self, quota: RequestQuota):
         async with self.redis_connection.pipeline() as pipeline:
             # TODO: for now semi High Availability can be done as - separate instance process/throttle some part for domain_status
 
-            [
-                pipeline.lpush(quota.domain, 1)
-                for quota in quotas
-                for _ in range(quota.concurrent_requests)
-            ]
+            [pipeline.lpush(quota.domain, 1) for _ in range(quota.concurrent_req)]
+            pipeline.ltrim(quota.domain, 0, quota.concurrent_req)
+            quota_added = await pipeline.execute()
 
-            [
-                pipeline.ltrim(quota.domain, 0, quota.concurrent_requests)
-                for quota in quotas
-            ]
-            # in case quota was not consumed we don't want to add to infinity
+            print(f"Quotas for {quota.domain} refilled.", quota_added)
 
-            result = await pipeline.execute()
-
-            print("Quotas refilled.", result)
-
-    @staticmethod
-    def _remove_quota(domain: str) -> None:
-        """Remove a list from available_semaphores"""
-        del available_quotas[domain]
+    async def _remove_quota(self, domain: str) -> None:
+        async with self.redis_connection.client() as r:
+            await r.delete(domain)
+            
 
 
 # quotas only for active robots? when starting a robot call Throttling manager?

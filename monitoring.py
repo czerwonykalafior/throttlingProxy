@@ -11,7 +11,9 @@ async def main():
     async with redis_conn.client() as r:
         while True:
             for domain in active_domains:
-                domain_status[domain.name] = await r.get(f"{domain.name}_queue"), await r.llen(domain.name)
+                domain_status[domain.name] = await r.get(
+                    f"{domain.name}_queue"
+                ), await r.llen(domain.name)
 
             print(domain_status)
 
